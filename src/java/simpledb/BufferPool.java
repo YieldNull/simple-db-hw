@@ -2,11 +2,10 @@ package simpledb;
 
 import java.io.*;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.NoSuchElementException;
 
 /**
  * BufferPool manages the reading and writing of pages into memory from
@@ -34,9 +33,94 @@ public class BufferPool {
      */
     public static final int DEFAULT_PAGES = 50;
 
-    private Map<PageId, Page> cache;
-
     private final int maxPages;
+    private final Map<PageId, PageNode> cache;
+    private final Map<PageId, Page> dirtyPages;
+
+    private final LRUList lruList;
+
+
+    /**
+     * A node recording cache value and its frequency of accessing
+     */
+    private static class PageNode {
+        PageNode pre;
+        PageNode next;
+
+        Page page;
+
+
+        PageNode(Page page) {
+            this.page = page;
+        }
+    }
+
+    /**
+     * An double-linked list sorted by recently used order.
+     */
+    private static class LRUList {
+        PageNode head;
+        PageNode tail;
+
+        int size;
+
+        /**
+         * Add a node to the head of list
+         *
+         * @param page page
+         */
+        PageNode add(Page page) {
+            PageNode node = new PageNode(page);
+
+            if (head == null) {
+                head = node;
+                head.pre = null;
+                head.next = null;
+                tail = head;
+            } else {
+                head.pre = node;
+                node.next = head;
+                node.pre = null;
+                head = node;
+            }
+            size++;
+
+            return node;
+        }
+
+        /**
+         * Remove a node.
+         *
+         * @param node node
+         */
+        void remove(PageNode node) {
+            if (node.pre != null) {
+                node.pre.next = node.next;
+            } else {
+                head = node.next; // node is the head
+            }
+
+            if (node.next == null) {
+                tail = node.pre; // node is the tail
+            } else {
+                node.next.pre = node.pre;
+            }
+            size--;
+        }
+
+        /**
+         * Remove tail node
+         *
+         * @return tail node
+         */
+        Page removeLast() throws NoSuchElementException {
+            if (tail == null) throw new NoSuchElementException();
+
+            Page page = tail.page;
+            remove(tail);
+            return page;
+        }
+    }
 
     /**
      * Creates a BufferPool that caches up to numPages pages.
@@ -47,6 +131,8 @@ public class BufferPool {
         // some code goes here
         cache = new HashMap<>();
         maxPages = numPages;
+        dirtyPages = new HashMap<>();
+        lruList = new LRUList();
     }
 
     public static int getPageSize() {
@@ -82,19 +168,20 @@ public class BufferPool {
             throws TransactionAbortedException, DbException {
         // some code goes here
 
-        Page page = cache.get(pid);
-        if (page == null) {
+        PageNode pageNode = cache.get(pid);
+        if (pageNode == null) {
             DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
-            page = dbFile.readPage(pid);
+            Page page = dbFile.readPage(pid);
 
-            if (cache.size() >= maxPages) {
-                throw new DbException("Insufficient space in buffer pool");
-            } else {
-                cache.put(pid, page);
+            if (cache.size() == maxPages) {
+                evictPage();
             }
+
+            pageNode = lruList.add(page);
+            cache.put(pid, pageNode);
         }
 
-        return page;
+        return pageNode.page;
     }
 
     /**
@@ -162,6 +249,12 @@ public class BufferPool {
             throws DbException, IOException, TransactionAbortedException {
         // some code goes here
         // not necessary for lab1
+
+        List<Page> pages = Database.getCatalog().getDatabaseFile(tableId).insertTuple(tid, t);
+        pages.forEach(p -> {
+            cache.put(p.getId(), lruList.add(p));
+            p.markDirty(true, tid);
+        });
     }
 
     /**
@@ -181,6 +274,12 @@ public class BufferPool {
             throws DbException, IOException, TransactionAbortedException {
         // some code goes here
         // not necessary for lab1
+
+        List<Page> pages = Database.getCatalog().getDatabaseFile(t.getRecordId().getPageId().getTableId()).deleteTuple(tid, t);
+        pages.forEach(p -> {
+            cache.put(p.getId(), lruList.add(p));
+            p.markDirty(true, tid);
+        });
     }
 
     /**
@@ -192,6 +291,9 @@ public class BufferPool {
         // some code goes here
         // not necessary for lab1
 
+        for (Page page : dirtyPages.values()) {
+            writePage(page);
+        }
     }
 
     /**
@@ -206,6 +308,7 @@ public class BufferPool {
     public synchronized void discardPage(PageId pid) {
         // some code goes here
         // not necessary for lab1
+        cache.remove(pid);
     }
 
     /**
@@ -216,6 +319,10 @@ public class BufferPool {
     private synchronized void flushPage(PageId pid) throws IOException {
         // some code goes here
         // not necessary for lab1
+        PageNode pageNode = cache.get(pid);
+        if (pageNode != null) {
+            writePage(pageNode.page);
+        }
     }
 
     /**
@@ -233,6 +340,23 @@ public class BufferPool {
     private synchronized void evictPage() throws DbException {
         // some code goes here
         // not necessary for lab1
+
+        Page page = lruList.removeLast();
+        cache.remove(page.getId());
+
+        if (dirtyPages.containsKey(page.getId())) {
+            dirtyPages.remove(page.getId());
+            try {
+                writePage(page);
+            } catch (IOException e) {
+                e.printStackTrace();
+                throw new DbException("Cannot flush evicted dirty page");
+            }
+        }
+
     }
 
+    private void writePage(Page page) throws IOException {
+        Database.getCatalog().getDatabaseFile(page.getId().getTableId()).writePage(page);
+    }
 }
